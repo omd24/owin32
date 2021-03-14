@@ -1,3 +1,13 @@
+/* ===========================================================
+   #File: source.c #
+   #Date: 14 Mar 2021 #
+   #Revision: 1.0 #
+   #Creator: Omid Miresmaeili #
+   #Description: An overivew of [c]strings foundations such as
+                    ANSI vs UTF-16, Copy, concat and compare strings
+   #Notice: (C) Copyright 2021 by Omid. All Rights Reserved. #
+   =========================================================== */
+
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 //#undef UNICODE    // Don't! instead use Properties > Advanced > Character Set
