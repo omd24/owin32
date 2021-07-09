@@ -13,6 +13,8 @@
 #include <tchar.h>
 #include <windowsx.h>
 
+#include "resource.h"   /* ui controls IDs (from editor) */
+
 // =========================================================================================
 
 /* X could be null */
@@ -140,15 +142,6 @@ HANDLE g_threads[MAXIMUM_WAIT_OBJECTS];
 int g_threads_count = 0;     // number of reader/writer threads
 
 // =========================================================================================
-
-//
-// UI Controls IDs
-//
-#define ID_DIALOGBOX_PARENT                 1
-#define ID_DIALOGBOX_ITEM_CLIENTS           1000
-#define ID_DIALOGBOX_ITEM_SERVERS           1001
-#define ID_BTN_STOP                         1002
-
 //
 // from "Windows via C/C++" source code:
 // The normal HANDLE_MSG macro in WindowsX.h does not work properly for dialog boxes
@@ -187,26 +180,127 @@ stop_processing() {
             CloseHandle(g_threads[g_threads_count]);
 
         // -- close each list box
-        add_text(GetDlgItem(g_hwnd, ID_DIALOGBOX_ITEM_SERVERS), TEXT("-----------------"));
-        add_text(GetDlgItem(g_hwnd, ID_DIALOGBOX_ITEM_CLIENTS), TEXT("-----------------"));
+        add_text(GetDlgItem(g_hwnd, IDC_LIST_SERVERS), TEXT("-----------------"));
+        add_text(GetDlgItem(g_hwnd, IDC_LIST_CLIENTS), TEXT("-----------------"));
     }
 }
 unsigned WINAPI
-stopping_thread_func (void * param_ptr) {
-
+StoppingThread_Func (void * param_ptr) {
     stop_processing();
     return(0);
 }
 unsigned WINAPI
-writer_thread_func (void * param_ptr) {
+WriterThread_Func (void * param_ptr) {
+    int thread_number = (intptr_t)param_ptr;
+    HWND hwnd_listbox = GetDlgItem(g_hwnd, IDC_LIST_CLIENTS);
 
-    //...
+    for (int request_number = 1; !g_shutdown; ++request_number) {
+        Element e = {thread_number, request_number};
+
+        // -- require acess for writing
+        AcquireSRWLockExclusive(&g_srwlock);
+
+        // -- if q is full, fall sleep as long as condition variable is not signaled
+        // NOTE(omid): during wait for lock, a shutdown might have been instructed
+        if (Queue_IsFull(&g_q) && !g_shutdown) {
+            add_text(
+                hwnd_listbox,
+                TEXT("[%d] Queue is full: Cannot add %d"), thread_number, request_number
+            );
+            // -- wait for a reader to empty a slot before acquiring lock again
+            SleepConditionVariableSRW(&g_cv_ready_to_write, &g_srwlock, INFINITE, 0);
+        }
+        if (g_shutdown) {   // -- shutting down
+
+            // NOTE(omid): Other writer threads might still be blocked on the lock
+            // -- release the lock. No need to keep the lock any longer
+            ReleaseSRWLockExclusive(&g_srwlock);
+            // -- signal other blocked writer threads it's time to exit
+            WakeAllConditionVariable(&g_cv_ready_to_write);
+
+            add_text(hwnd_listbox, TEXT("[%d] exiting; Bye Bye"), thread_number);
+            // -- always return from exiting thread
+            return(0);
+        } else {
+            // -- add new element
+            Queue_AddElement(&g_q, e);
+
+            add_text(hwnd_listbox, TEXT("[%d] adding %d"), thread_number, request_number);
+
+            // -- no need to keep the lock after writing
+            ReleaseSRWLockExclusive(&g_srwlock);
+
+            // -- signal reader threads there is new element to read
+            WakeAllConditionVariable(&g_cv_ready_to_read);
+
+            // -- wait before adding another element
+            Sleep(1500);
+        }
+    }
+    add_text(hwnd_listbox, TEXT("[%d] exiting; Bye Bye"), thread_number);
+    // -- always return from exiting thread
     return(0);
 }
-unsigned WINAPI
-reader_thread_func (void * param_ptr) {
+static BOOL
+consume_element (int thread_num, int request_num, HWND lbox) {
+    // get shared access to queue to read an element
+    AcquireSRWLockShared(&g_srwlock);
 
-    //...
+    // fall asleep until there is s.th. to read
+    // check if, while asleep, it was not decided to stop the thread
+    while (Queue_IsEmpty(&g_q, thread_num) && !g_shutdown) {
+        // no readable element
+        add_text(lbox, TEXT("[%d] Nothing to process"), thread_num);
+
+        // since q is empty wait until writers produce anything
+        SleepConditionVariableSRW(
+            &g_cv_ready_to_read,
+            &g_srwlock,
+            INFINITE,
+            CONDITION_VARIABLE_LOCKMODE_SHARED
+        );
+    }
+    // on the other hand, when thread is exiting, lock should be released,
+    // and other reader(s) should be signaled through condition variables
+    if (g_shutdown) {
+        add_text(lbox, TEXT("[%d] exiting; Bye Bye"), thread_num);
+
+        ReleaseSRWLockShared(&g_srwlock);
+        WakeConditionVariable(&g_cv_ready_to_read);
+
+        return FALSE;
+    }
+    //
+    // Consuming new element. Here we know q is not empty 
+    Element e;
+    Queue_GetNewElement(&g_q, thread_num, &e);
+
+    // -- no need to keep the lock any longer
+    ReleaseSRWLockShared(&g_srwlock);
+
+    add_text(
+        lbox, TEXT("[%d] Processing %d: %d"), thread_num,
+        e.thread_number, e.request_number
+    );
+
+    // -- notify writers a free slot became available to produce new element
+    WakeConditionVariable(&g_cv_ready_to_write);
+
+    return TRUE;
+}
+unsigned WINAPI
+ReaderThread_Func (void * param_ptr) {
+    int thread_number = (intptr_t)param_ptr;
+    HWND hwnd_listbox = GetDlgItem(g_hwnd, IDC_LIST_SERVERS);
+
+    for (int request_number = 1; !g_shutdown; ++request_number) {
+        if (FALSE == consume_element(thread_number, request_number, hwnd_listbox))
+            return (0);
+        Sleep(2500);    // wait before reading another element
+    }
+    // g_shutdown has been set during sleep
+    add_text(hwnd_listbox, TEXT("[%d] exiting; Bye Bye"), thread_number);
+    // -- always return from exiting thread
     return(0);
 }
 BOOL
@@ -229,13 +323,13 @@ DialogBox_OnInit (HWND hwnd, HWND hwnd_focus, LPARAM lparam) {
     unsigned int thread_id;
     for (int i = 0; i < 4; ++i)
         g_threads[g_threads_count++] =
-            (HANDLE)_beginthreadex(NULL, 0, writer_thread_func, (void *)i, 0, &thread_id);
+        (HANDLE)_beginthreadex(NULL, 0, WriterThread_Func, (void *)(intptr_t)i, 0, &thread_id);
 
-    //
-    // Create two reader threads
+//
+// Create two reader threads
     for (int i = 0; i < 2; ++i)
         g_threads[g_threads_count++] =
-            (HANDLE)_beginthreadex(NULL, 0, reader_thread_func, (void *)i, 0, &thread_id);
+        (HANDLE)_beginthreadex(NULL, 0, ReaderThread_Func, (void *)(intptr_t)i, 0, &thread_id);
 
     return TRUE;
 }
@@ -245,12 +339,12 @@ DialogBox_OnCommand (HWND hwnd, int id, HWND hwnd_control, UINT code_notify) {
     case IDCANCEL:
         EndDialog(hwnd, id);
         break;
-    case ID_BTN_STOP: {
+    case IDC_BTN_STOP: {
         // -- stop_processing cannot be called from UI thread (a deadlock occurs)
         // -- another thread is required
         unsigned int thread_id;
         CloseHandle(
-            (HANDLE)_beginthreadex(NULL, 0, stopping_thread_func, NULL, 0, &thread_id)
+            (HANDLE)_beginthreadex(NULL, 0, StoppingThread_Func, NULL, 0, &thread_id)
         );
         // -- the button cannot be pushed twice
         Button_Enable(hwnd_control, FALSE);
@@ -266,8 +360,6 @@ DialogBox_Func (HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam) {
     return FALSE;
 }
 
-
-
 // =========================================================================================
 
 int WINAPI
@@ -279,8 +371,10 @@ _tWinMain(
 ) {
     UNREFERENCED_PARAMETER(prev);
     UNREFERENCED_PARAMETER(showcmd);
+    Queue_Init(&g_q, 10);
     // NOTE(omid): The resource identifier of dialog box is created by MAKEINTRESOURCE macro
-    DialogBox(instance, MAKEINTRESOURCE(ID_DIALOGBOX_PARENT), NULL, &DialogBox_Func);
+    DialogBox(instance, MAKEINTRESOURCE(IDD_DIALOG_MAIN), NULL, &DialogBox_Func);
     stop_processing();
+    Queue_Deinit(&g_q);
     return(0);
 }
